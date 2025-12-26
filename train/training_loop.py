@@ -292,6 +292,21 @@ class TrainLoop:
     def run_step(self, batch, cond):
         self.forward_backward(batch, cond)
         self.mp_trainer.optimize(self.opt)
+
+        if self.step % 200 == 0 and hasattr(self.model, 'contact_posterior'):
+            print(f"[GRAD CHECK] Step {self.step}")
+            found_grad = False
+            for name, param in self.model.contact_posterior.named_parameters():
+                if param.grad is not None:
+                    grad_mean = param.grad.abs().mean().item()
+                    grad_max = param.grad.abs().max().item()
+                    print(f"  > ContactPosterior ({name}): Mean={grad_mean:.6f} | Max={grad_max:.6f}")
+                    found_grad = True
+                    break # Just check the first valid parameter to verify flow
+            
+            if not found_grad:
+                print("  > WARNING: No gradients found in ContactPosterior! Check your computation graph.")
+
         self.update_average_model()
         self._anneal_lr()
         self.log_step()
@@ -308,6 +323,148 @@ class TrainLoop:
                 # avg = alpha * avg + param * (1 - alpha)
                 avg_param.data.mul_(self.args.avg_model_beta).add_(
                     param.data, alpha=1 - self.args.avg_model_beta)
+                
+    def calc_virtual_observation_loss(self, x0, contact_logits):
+        """ Calculates Expected VO Loss: Sum[ P(c|x0) * Loss(Geometry) ] """
+        
+        # Get Posterior Probabilities
+        probs = torch.softmax(contact_logits, dim=-1)
+        
+        # L_Heel active if Left(0) is Heel(1) or Both(3)
+        w_L_heel = probs[..., 0, 1] + probs[..., 0, 3]
+        w_L_toe  = probs[..., 0, 2] + probs[..., 0, 3]
+        w_R_heel = probs[..., 1, 1] + probs[..., 1, 3]
+        w_R_toe  = probs[..., 1, 2] + probs[..., 1, 3]
+
+        # --- BRANCH A: HumanML3D (hml_vec) ---
+        if self.model.data_rep == 'hml_vec':
+            from data_loaders.humanml.scripts.motion_process import recover_from_ric
+            
+            # 1. Recover XYZ of Skeleton
+            B, J, F, T = x0.shape
+            x0_perm = x0.permute(0, 3, 1, 2).reshape(B, T, J*F)
+            
+            # --- FIX: Convert NumPy -> Tensor ---
+            mean = torch.from_numpy(self.data.dataset.t2m_dataset.mean).float().to(x0.device)
+            std = torch.from_numpy(self.data.dataset.t2m_dataset.std).float().to(x0.device)
+            # ------------------------------------
+            
+            x0_unnorm = x0_perm * std + mean
+            
+            # Recover XYZ joints [B, T, 22, 3]
+            x_xyz = recover_from_ric(x0_unnorm.float(), 22)
+            
+            # 2. Apply Static Offsets (Approximation)
+            geo = self.model.geometry_wrapper
+            
+            # Left Ankle is Index 10, Right is 11
+            pos_l_ankle = x_xyz[..., 10, :] 
+            pos_l_toe   = pos_l_ankle + geo.offset_l_toe
+            pos_l_heel  = pos_l_ankle + geo.offset_l_heel
+            
+            pos_r_ankle = x_xyz[..., 11, :]
+            pos_r_toe   = pos_r_ankle + geo.offset_r_toe
+            pos_r_heel  = pos_r_ankle + geo.offset_r_heel
+
+            # 3. Compute Height Loss
+            loss_eq = (
+                w_L_heel * pos_l_heel[..., 1]**2 + 
+                w_L_toe  * pos_l_toe[..., 1]**2 +
+                w_R_heel * pos_r_heel[..., 1]**2 + 
+                w_R_toe  * pos_r_toe[..., 1]**2
+            ).mean()
+            
+            # 4. Compute Slip Loss
+            vel_l = (pos_l_ankle[:, 1:] - pos_l_ankle[:, :-1]).pow(2).sum(dim=-1)
+            vel_r = (pos_r_ankle[:, 1:] - pos_r_ankle[:, :-1]).pow(2).sum(dim=-1)
+            
+            loss_slip = (
+                (w_L_heel[:, :-1] + w_L_toe[:, :-1]) * vel_l +
+                (w_R_heel[:, :-1] + w_R_toe[:, :-1]) * vel_r
+            ).mean()
+
+            is_near_floor_L = (pos_l_heel[..., 1] < 0.03) | (pos_l_toe[..., 1] < 0.03)
+            is_near_floor_R = (pos_r_heel[..., 1] < 0.03) | (pos_r_toe[..., 1] < 0.03)
+            
+            target_L = is_near_floor_L.float().detach()
+            target_R = is_near_floor_R.float().detach()
+
+            # Binary Cross Entropy to force probabilities up when close to ground
+            # Clamp probabilities to avoid log(0) errors
+            w_L_clamped = torch.clamp(w_L_heel + w_L_toe, min=1e-4, max=1-1e-4)
+            w_R_clamped = torch.clamp(w_R_heel + w_R_toe, min=1e-4, max=1-1e-4)
+            
+            loss_heuristic = (
+                torch.nn.functional.binary_cross_entropy(w_L_clamped, target_L) +
+                torch.nn.functional.binary_cross_entropy(w_R_clamped, target_R)
+            )
+
+            if self.step % 100 == 0:
+                print(f"\n[PHYSICS CHECK] Step {self.step}")
+                # Check Y-axis (index 1) of the first batch, first frame
+                h_val_L = pos_l_heel[0, 0, 1].item()
+                p_L_contact = (w_L_heel + w_L_toe)[0, 0].item() # Sum heel+toe prob
+                
+                print(f"  > Left Heel Height: {h_val_L:.4f} m")
+                print(f"  > Contact Prob (L): {p_L_contact:.4f} (Target: {target_L[0,0].item()})")
+                print(f"  > VO Loss: {loss_eq.item():.6f}")
+                print(f"  > Heuristic Loss: {loss_heuristic.item():.6f}")
+
+            return loss_eq + loss_slip + (loss_heuristic * 1.0)
+        # --- BRANCH B: SMPL Mesh (Rotations) ---
+        else:
+            # ... (Previous SMPL logic remains the same) ...
+            # Ensure device
+            try:
+                smpl_device = next(self.model.rot2xyz.smpl_model.parameters()).device
+            except StopIteration:
+                smpl_device = next(self.model.rot2xyz.smpl_model.buffers()).device
+            if smpl_device != x0.device:
+                self.model.rot2xyz.smpl_model.to(x0.device)
+
+            vertices = self.model.rot2xyz(
+                x0, mask=None, pose_rep=self.model.data_rep, translation=True, glob=True,
+                jointstype='vertices', vertstrans=True
+            )
+
+            geo = self.model.geometry_wrapper
+            landmarks = geo.get_landmarks(vertices)
+            heights = geo.compute_heights(landmarks)
+            vel_sq = geo.compute_tangential_velocities(landmarks)
+
+            loss_eq = (
+                w_L_heel * heights['L_Heel']**2 + w_L_toe * heights['L_Toe']**2 +
+                w_R_heel * heights['R_Heel']**2 + w_R_toe * heights['R_Toe']**2
+            ).mean()
+
+            loss_slip = (
+                w_L_heel[:, :-1] * vel_sq['L_Heel'] + w_L_toe[:, :-1] * vel_sq['L_Toe'] +
+                w_R_heel[:, :-1] * vel_sq['R_Heel'] + w_R_toe[:, :-1] * vel_sq['R_Toe']
+            ).mean()
+
+        if self.step % 100 == 0:
+            # Get probabilities for the first batch item
+            probs = torch.softmax(contact_logits, dim=-1)
+            p_L_contact = probs[0, 0, 1] + probs[0, 0, 3] # Heel + Both
+            
+            # Get physical values (Branch A vs B handling)
+            if self.model.data_rep == 'hml_vec':
+                 # Re-extract for logging if needed, or use variables from Branch A above
+                 # Assuming 'pos_l_heel' and 'pos_r_toe' are available from the Branch A block
+                 h_val_L = pos_l_heel[0, 0, 1].item() 
+                 h_val_R = pos_r_toe[0, 0, 1].item()
+            else:
+                 # Assuming 'heights' dict is available from Branch B
+                 h_val_L = heights['L_Heel'][0, 0].item()
+                 h_val_R = heights['R_Toe'][0, 0].item()
+
+            print(f"\n[PHYSICS CHECK] Step {self.step}")
+            print(f"  > Left Heel Height: {h_val_L:.4f} (Goal: near 0.0 when contact=1)")
+            print(f"  > Right Toe Height: {h_val_R:.4f}")
+            print(f"  > Contact Prob (L): {p_L_contact.item():.2f}")
+            print(f"  > VO Loss Components: EQ={loss_eq.item():.6f} | SLIP={loss_slip.item():.6f}")
+
+            return loss_eq + loss_slip
 
     def forward_backward(self, batch, cond):
         self.mp_trainer.zero_grad()
@@ -318,8 +475,19 @@ class TrainLoop:
             micro = batch
             micro_cond = cond
             last_batch = (i + self.microbatch) >= batch.shape[0]
+            
+            # 1. Sample Timesteps
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
+            # [ELBO MODIFICATION]
+            # If using AR Decoder, the Diffusion model only handles t >= 2 (Paper notation).
+            # In MDM code (0-indexed), this means t >= 1.
+            # We force t to be at least 1, so the diffusion UNet ignores the t=0 step.
+            if hasattr(self.model, 'use_ar_decoder') and self.model.use_ar_decoder:
+                t = torch.clamp(t, min=1)
+
+            # 2. Compute Standard Diffusion Loss
+            # (This is your original logic, preserved)
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
                 self.ddp_model,
@@ -340,11 +508,77 @@ class TrainLoop:
                     t, losses["loss"].detach()
                 )
 
-            loss = (losses["loss"] * weights).mean()
+            # Base Diffusion Loss
+            loss_diffusion = (losses["loss"] * weights).mean()
+            
+            # 3. [ELBO MODIFICATION] Add Hybrid Terms
+            if hasattr(self.model, 'use_ar_decoder') and self.model.use_ar_decoder:
+                
+                # A. Generate x1 (Noisy state at t=1 / code-index 0)
+                t_one = torch.zeros(micro.shape[0], device=dist_util.dev(), dtype=torch.long)
+                x1 = self.diffusion.q_sample(micro, t_one)
+                
+                # Reshape for Transformer [B, S, D]
+                # MDM internal: [B, Joints, Feats, Frames] -> [B, Frames, Joints*Feats]
+                B, J, F, T = micro.shape
+                x0_seq = micro.permute(0, 3, 1, 2).reshape(B, T, J*F)
+                x1_seq = x1.permute(0, 3, 1, 2).reshape(B, T, J*F)
+                
+                # Get Text Embedding
+                y_emb = micro_cond['y'].get('text_embed')
+                if y_emb is None:
+                     y_emb = self.model.encode_text(micro_cond['y']['text'])
+
+                # Check for [1, Batch, Dim] shape (Common in MDM/Transformers)
+                if y_emb.ndim == 3 and y_emb.shape[0] == 1:
+                    y_emb = y_emb.permute(1, 0, 2)  # [1, B, D] -> [B, 1, D]
+                
+                # Check for [Batch, Dim] shape
+                elif y_emb.ndim == 2:
+                    y_emb = y_emb.unsqueeze(1)      # [B, D] -> [B, 1, D]
+                
+                # B. Posterior Pass (Condition on Clean x0)
+                logits_q = self.model.contact_posterior(x0_seq)
+                c_dist_q = torch.distributions.Categorical(logits=logits_q)
+                c_sample = c_dist_q.sample() # Sample for AR input
+                
+                # C. Prior Pass (Condition on Noisy x1 + Text)
+                logits_p = self.model.contact_prior(x1_seq, y_emb)
+                
+                # D. KL Divergence Loss: Sum( q * (log q - log p) )
+                log_q = torch.log_softmax(logits_q, dim=-1)
+                log_p = torch.log_softmax(logits_p, dim=-1)
+                loss_kl = (torch.exp(log_q) * (log_q - log_p)).sum(dim=-1).mean()
+                
+                # E. AR Decoder Loss (NLL)
+                # Shift x0 right for teacher forcing
+                x0_shifted = torch.cat([torch.zeros_like(x0_seq[:, :1, :]), x0_seq[:, :-1, :]], dim=1)
+                pi, mu, sigma = self.model.terminal_decoder(x0_shifted, x1_seq, c_sample, y_emb)
+                
+                # Calculate NLL (Target is x0_seq)
+                loss_term = -self.model.terminal_decoder.mog_head.log_prob(x0_seq, pi, mu, sigma).mean()
+                
+                # F. Virtual Observation Loss (Geometric Constraints)
+                loss_vo = self.calc_virtual_observation_loss(micro, logits_q)
+
+                # Total Loss Summation
+                # Note: You may need to tune '0.001' for KL stability
+                total_loss = loss_diffusion + loss_term + loss_vo + (loss_kl * 0.001)
+                
+                # Add to logging dict
+                losses['ar_nll'] = loss_term.detach()
+                losses['vo'] = loss_vo.detach()
+                losses['kl'] = loss_kl.detach()
+                
+            else:
+                # If AR is disabled, just use standard diffusion loss
+                total_loss = loss_diffusion
+
+            # 4. Backward Pass & Logging
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )
-            self.mp_trainer.backward(loss)
+            self.mp_trainer.backward(total_loss)
 
     def _anneal_lr(self):
         if not self.lr_anneal_steps:

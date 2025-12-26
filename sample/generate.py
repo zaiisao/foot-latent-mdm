@@ -20,6 +20,84 @@ from data_loaders.tensors import collate
 from moviepy.editor import clips_array
 
 
+@torch.no_grad()
+def sample_hybrid(model, diffusion, shape, model_kwargs):
+    """
+    Hybrid Sampling:
+    1. Diffusion T -> 2 (reaches x1)
+    2. Prior Net predicts Physics-Informed Contact (c) from x1
+    3. AR Decoder generates x0 from x1 + c
+    """
+    device = dist_util.dev()
+    B, J, F, T = shape
+    
+    # Handle CFG Wrapper to access inner modules
+    inner_model = model.model if hasattr(model, 'model') else model
+
+    # 1. Diffusion Loop (T -> 2)
+    # Start from random noise
+    img = torch.randn(shape, device=device)
+    
+    # Iterate manually to stop exactly at t=1 (index 0)
+    # Standard diffusion indices go 999 -> 0. We stop after 1 is processed.
+    indices = list(range(diffusion.num_timesteps))[::-1]
+
+    for i in indices:
+        t = torch.tensor([i] * shape[0], device=device)
+        
+        # Stop before the final denoising step
+        if i == 0: 
+            break
+            
+        out = diffusion.p_sample(
+            model, # Use wrapped model for CFG support
+            img,
+            t,
+            clip_denoised=False,
+            model_kwargs=model_kwargs
+        )
+        img = out["sample"]
+        
+    # 'img' is now x1 (noisy state)
+    x1 = img
+    
+    # 2. Reshape for Transformers [B, T, D]
+    x1_seq = x1.permute(0, 3, 1, 2).reshape(B, T, J * F)
+    
+    # Get Text Embed (Prior Condition)
+    y_emb = model_kwargs['y'].get('text_embed')
+    if y_emb is None:
+        y_emb = inner_model.encode_text(model_kwargs['y']['text'])
+        
+    # 3. Sample Contacts from PRIOR
+    # This corresponds to sampling the "Virtual Observable" distribution q(r|x)
+    logits_p = inner_model.contact_prior(x1_seq, y_emb)
+    c_sample = torch.distributions.Categorical(logits=logits_p).sample()
+    
+    # 4. Autoregressive Generation (t=1 -> t=0)
+    x0_gen = torch.zeros_like(x1_seq)
+    
+    for t_step in range(T):
+        # Forward pass (Masking handles future)
+        pi, mu, sigma = inner_model.terminal_decoder(x0_gen, x1_seq, c_sample, y_emb)
+        
+        # Select current step parameters
+        pi_t = pi[:, t_step, :]
+        mu_t = mu[:, t_step, :, :]
+        sigma_t = sigma[:, t_step, :, :]
+        
+        # Sample from MoG
+        k_idx = torch.distributions.Categorical(logits=pi_t).sample()
+        batch_idx = torch.arange(B, device=device)
+        mu_chosen = mu_t[batch_idx, k_idx]
+        sigma_chosen = sigma_t[batch_idx, k_idx]
+        
+        frame = torch.normal(mu_chosen, sigma_chosen)
+        x0_gen[:, t_step, :] = frame
+        
+    # Reshape back to [B, J, F, T]
+    return x0_gen.reshape(B, T, J, F).permute(0, 2, 3, 1)
+
 def main(args=None):
     if args is None:
         # args is None unless this method is called from another function (e.g. during training)
@@ -128,8 +206,11 @@ def main(args=None):
         model_kwargs['y']['scale'] = torch.ones(args.batch_size, device=dist_util.dev()) * args.guidance_param
     
     if 'text' in model_kwargs['y'].keys():
-        # encoding once instead of each iteration saves lots of time
-        model_kwargs['y']['text_embed'] = model.encode_text(model_kwargs['y']['text'])
+        # Check if wrapped in ClassifierFreeSampleModel
+        if hasattr(model, 'encode_text'):
+            model_kwargs['y']['text_embed'] = model.encode_text(model_kwargs['y']['text'])
+        elif hasattr(model, 'model') and hasattr(model.model, 'encode_text'):
+             model_kwargs['y']['text_embed'] = model.model.encode_text(model_kwargs['y']['text'])
     
     if args.dynamic_text_path != '':
         # Rearange the text to match the autoregressive sampling - each prompt fits to a single prediction
@@ -144,18 +225,25 @@ def main(args=None):
     for rep_i in range(args.num_repetitions):
         print(f'### Sampling [repetitions #{rep_i}]')
 
-        sample = sample_fn(
-            model,
-            motion_shape,
-            clip_denoised=False,
-            model_kwargs=model_kwargs,
-            skip_timesteps=0,  # 0 is the default value - i.e. don't skip any step
-            init_image=init_image,
-            progress=True,
-            dump_steps=None,
-            noise=None,
-            const_noise=False,
-        )
+        # --- MODIFIED: Switch to Hybrid Sampler if AR flag is set ---
+        if hasattr(args, 'use_ar_decoder') and args.use_ar_decoder:
+            print(">>> Using Hybrid ELBO Sampling (Diffusion -> Prior -> AR)")
+            # This path uses the Prior Net to enforce Physics-Informed constraints
+            sample = sample_hybrid(model, diffusion, motion_shape, model_kwargs)
+        else:
+            # Standard MDM Sampling path
+            sample = sample_fn(
+                model,
+                motion_shape,
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+                skip_timesteps=0,  
+                init_image=init_image,
+                progress=True,
+                dump_steps=None,
+                noise=None,
+                const_noise=False,
+            )
 
         # Recover XYZ *positions* from HumanML3D vector representation
         if model.data_rep == 'hml_vec':

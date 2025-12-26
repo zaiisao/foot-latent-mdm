@@ -779,7 +779,7 @@ class HumanML3D(data.Dataset):
         opt.disable_offset_aug = is_autoregressive and (opt.fixed_len > 0) and (mode == 'eval')  # for autoregressive evaluation, use the start of the motion and not something from the middle
         self.opt = opt
         print('Loading dataset %s ...' % opt.dataset_name)
-
+        print(f"DEBUG: Loading Mean/Std from: {pjoin(opt.data_root, 'Mean.npy')}") # <--- Add this
         if mode == 'gt':
             # used by T2M models (including evaluators)
             self.mean = np.load(pjoin(opt.meta_dir, f'{opt.dataset_name}_mean.npy'))

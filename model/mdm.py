@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import clip
 from model.rotation2xyz import Rotation2xyz
 from model.BERT.BERT_encoder import load_bert
+from model.foot_contact import TerminalARDecoder, ContactNet, SMPLGeometryWrapper
 from utils.misc import WeightedSum
 
 
@@ -133,6 +134,26 @@ class MDM(nn.Module):
                                             self.nfeats)
 
         self.rot2xyz = Rotation2xyz(device='cpu', dataset=self.dataset)
+
+        if kargs.get('use_ar_decoder', False):
+            print("Initializing ELBO Architecture: AR Decoder, Dual Contact Nets, Geometry")
+            self.use_ar_decoder = True
+            
+            # 1. Terminal Decoder (AR)
+            self.terminal_decoder = TerminalARDecoder(self.input_feats, self.latent_dim)
+            
+            # 2. Contact Networks (Prior and Posterior)
+            # Posterior: Conditions on Clean x0 (Used for Training & VO)
+            self.contact_posterior = ContactNet(self.input_feats, self.latent_dim, condition_on_text=False)
+            
+            # Prior: Conditions on Noisy x1 + Text (Used for Inference & KL)
+            self.contact_prior = ContactNet(self.input_feats, self.latent_dim, condition_on_text=True)
+            
+            # 3. Geometry Wrapper (for VO Loss)
+            self.geometry_wrapper = SMPLGeometryWrapper()
+            
+        else:
+            self.use_ar_decoder = False
 
     def parameters_wo_clip(self):
         return [p for name, p in self.named_parameters() if not name.startswith('clip_model.')]

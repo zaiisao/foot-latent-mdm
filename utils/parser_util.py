@@ -132,7 +132,8 @@ def add_model_options(parser):
     group.add_argument("--pred_len", default=0, type=int, help="If context_len larger than 0, will do prefix completion. If pred_len will not be specified - will use the same length as context_len")
     
 
-
+    group.add_argument("--use_ar_decoder", action='store_true',
+                       help="If True, enables the ELBO architecture (ContactNets + AR Decoder) for Physics-Informed Diffusion.")
 
 def add_data_options(parser):
     group = parser.add_argument_group('dataset')

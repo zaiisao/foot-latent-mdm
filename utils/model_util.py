@@ -58,6 +58,8 @@ def get_model_args(args, data):
     multi_encoder_type = args.__dict__.get('multi_encoder_type', 'multi')
     target_enc_layers = args.__dict__.get('target_enc_layers', 1)
 
+    use_ar_decoder = getattr(args, 'use_ar_decoder', False)
+
     return {'modeltype': '', 'njoints': njoints, 'nfeats': nfeats, 'num_actions': num_actions,
             'translation': True, 'pose_rep': 'rot6d', 'glob': True, 'glob_rot': True,
             'latent_dim': args.latent_dim, 'ff_size': 1024, 'num_layers': args.layers, 'num_heads': 4,
@@ -68,6 +70,7 @@ def get_model_args(args, data):
             'pos_embed_max_len': args.pos_embed_max_len, 'mask_frames': args.mask_frames,
             'pred_len': args.pred_len, 'context_len': args.context_len, 'emb_policy': emb_policy,
             'all_goal_joint_names': all_goal_joint_names, 'multi_target_cond': multi_target_cond, 'multi_encoder_type': multi_encoder_type, 'target_enc_layers': target_enc_layers,
+            'use_ar_decoder': use_ar_decoder,
             }
 
 
