@@ -6,7 +6,7 @@ import clip
 from model.rotation2xyz import Rotation2xyz
 from model.BERT.BERT_encoder import load_bert
 from utils.misc import WeightedSum
-
+from .transformer import CrossAttentionEncoder, CrossAttentionEncoderLayer
 
 class MDM(nn.Module):
     def __init__(self, modeltype, njoints, nfeats, num_actions, translation, pose_rep, glob, glob_rot,
@@ -72,7 +72,17 @@ class MDM(nn.Module):
             elif self.multi_encoder_type == 'split':
                self.embed_target_cond = EmbedTargetLocSplit(self.all_goal_joint_names, self.latent_dim, self.target_enc_layers)     
         
-        if self.arch == 'trans_enc':
+        if self.arch == 'cross_attn_trans_enc':
+            print("CROSS_ATTN_TRANS_ENC init")
+            seqTransEncoderLayer = CrossAttentionEncoderLayer(d_model=self.latent_dim,
+                                                              nhead=self.num_heads,
+                                                              dim_feedforward=self.ff_size,
+                                                              dropout=self.dropout,
+                                                              activation=self.activation)
+
+            self.seqTransEncoder = CrossAttentionEncoder(seqTransEncoderLayer,
+                                                         num_layers=self.num_layers)
+        elif self.arch == 'trans_enc':
             print("TRANS_ENC init")
             seqTransEncoderLayer = nn.TransformerEncoderLayer(d_model=self.latent_dim,
                                                               nhead=self.num_heads,
@@ -211,19 +221,28 @@ class MDM(nn.Module):
                 enc_text = y['text_embed']
             else:
                 enc_text = self.encode_text(y['text'])
+            
+            text_mask = None
             if type(enc_text) == tuple:
                 enc_text, text_mask = enc_text
                 if text_mask.shape[0] == 1 and bs > 1:  # casting mask for the single-prompt-for-all case
                     text_mask = torch.repeat_interleave(text_mask, bs, dim=0)
+
             text_emb = self.embed_text(self.mask_cond(enc_text, force_mask=force_mask))  # casting mask for the single-prompt-for-all case
             if self.emb_policy == 'add':
                 emb = text_emb + time_emb
-            else:
+            elif self.emb_policy == 'concat':
                 emb = torch.cat([time_emb, text_emb], dim=0)
                 text_mask = torch.cat([torch.zeros_like(text_mask[:, 0:1]), text_mask], dim=1)
+            elif self.emb_policy == 'none':
+                pass
+            else:
+                raise ValueError('Unknown emb_policy {}'.format(self.emb_policy))
+
         if 'action' in self.cond_mode:
             action_emb = self.embed_action(y['action'])
             emb = time_emb + self.mask_cond(action_emb, force_mask=force_mask)
+
         if self.cond_mode == 'no_cond': 
             # unconstrained
             emb = time_emb
@@ -246,7 +265,26 @@ class MDM(nn.Module):
                 step_mask = torch.zeros((bs, 1), dtype=torch.bool, device=x.device)
                 frames_mask = torch.cat([step_mask, frames_mask], dim=1)
 
-        if self.arch == 'trans_enc':
+        if self.arch == 'cross_attn_trans_enc':
+            xseq = self.sequence_pos_encoder(x)
+
+            # print(f"\n[MDM LEVEL] Checking Injection:")
+            # print(f"   > Motion Shape (xseq): {xseq.shape} (Should be [Seq, Batch, 512])")
+            # print(f"   > Time Shape (time_emb): {time_emb.shape} (Should be [1, Batch, 512])")
+            
+            # if text_emb is not None:
+            #     print(f"   > Text Shape (memory): {text_emb.shape} (Should be [Seq, Batch, 512])")
+            # else:
+            #     print(f"   > Text Shape: None")
+
+            output = self.seqTransEncoder(
+                xseq,
+                src_key_padding_mask=frames_mask,
+                memory=text_emb,
+                memory_key_padding_mask=text_mask,
+                time_emb=time_emb
+            )
+        elif self.arch == 'trans_enc':
             # adding the timestep embed
             xseq = torch.cat((emb, x), axis=0)  # [seqlen+1, bs, d]
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]
