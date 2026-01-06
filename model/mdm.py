@@ -6,7 +6,85 @@ import clip
 from model.rotation2xyz import Rotation2xyz
 from model.BERT.BERT_encoder import load_bert
 from utils.misc import WeightedSum
+from .transformer import CrossAttentionEncoder, CrossAttentionEncoderLayer
 
+class AutoregressiveRefiner(nn.Module):
+    def __init__(self, njoints, nfeats, latent_dim=256, ff_size=1024, num_layers=4, num_heads=4, 
+                 dropout=0.1, activation="gelu", n_modes=5, data_rep='rot6d', **kargs):
+        super().__init__()
+        
+        self.latent_dim = latent_dim
+        self.n_modes = n_modes
+
+        # This projects raw skeletal data (e.g. 66 dims) -> latent_dim (512 dims)
+        input_feats = njoints * nfeats
+        self.input_process = InputProcess(data_rep, input_feats, latent_dim)
+        
+        # The MDM output (z_plan) is also raw skeletal data, so it needs the same projection
+        self.plan_embedding = InputProcess(data_rep, input_feats, latent_dim)
+        self.sequence_pos_encoder = PositionalEncoding(latent_dim, dropout)
+        
+        decoder_layer = nn.TransformerDecoderLayer(d_model=latent_dim,
+                                                   nhead=num_heads,
+                                                   dim_feedforward=ff_size,
+                                                   dropout=dropout,
+                                                   activation=activation)
+        self.seqTransDecoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        
+        # MoG Heads
+        self.head_pi = nn.Linear(latent_dim, n_modes)
+        self.head_mu = nn.Linear(latent_dim, n_modes * input_feats)
+        self.head_sigma = nn.Linear(latent_dim, n_modes * input_feats)
+
+    def forward(self, x_past, z_plan):
+        x_emb = self.input_process(x_past)
+        x_emb = self.sequence_pos_encoder(x_emb)
+
+        memory = self.plan_embedding(z_plan)
+        memory = self.sequence_pos_encoder(memory)
+
+        seq_len = x_emb.shape[0]
+        tgt_mask = self.generate_square_subsequent_mask(seq_len).to(x_emb.device)
+        out = self.seqTransDecoder(tgt=x_emb, memory=memory, tgt_mask=tgt_mask)
+         
+        out = out.permute(1, 0, 2)
+        pi = self.head_pi(out)
+        mu = self.head_mu(out)
+        log_sigma = self.head_sigma(out)
+        
+        bs, seq, _ = out.shape
+        mu = mu.view(bs, seq, self.n_modes, -1)
+        sigma = torch.exp(log_sigma.view(bs, seq, self.n_modes, -1))
+        
+        return pi, mu, sigma
+
+    def generate_square_subsequent_mask(self, sz):
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+    
+    def straight_through_sample(self, pi_logits, mu):
+        """
+        Selects the most likely mode (Hard Argmax) but keeps gradients (Softmax).
+        Essential for training with Physical/Geometric losses (L_VO).
+        """
+        # 1. Soft probabilities (for gradient flow)
+        pi_soft = F.softmax(pi_logits, dim=-1) # [B, Seq, K]
+        
+        # 2. Hard selection (for physical reality)
+        k_star = pi_logits.argmax(dim=-1) # [B, Seq]
+        pi_hard = F.one_hot(k_star, num_classes=self.n_modes).float()
+        
+        # 3. Straight-Through Trick: Forward=Hard, Backward=Soft
+        pi_ste = (pi_hard - pi_soft).detach() + pi_soft
+        
+        # 4. Select the corresponding Mean (mu)
+        # mu: [B, Seq, K, D]
+        # pi_ste: [B, Seq, K] -> [B, Seq, K, 1]
+        x_out = (pi_ste.unsqueeze(-1) * mu).sum(dim=2) 
+        
+        # Returns [B, Seq, D]
+        return x_out
 
 class MDM(nn.Module):
     def __init__(self, modeltype, njoints, nfeats, num_actions, translation, pose_rep, glob, glob_rot,
@@ -72,7 +150,17 @@ class MDM(nn.Module):
             elif self.multi_encoder_type == 'split':
                self.embed_target_cond = EmbedTargetLocSplit(self.all_goal_joint_names, self.latent_dim, self.target_enc_layers)     
         
-        if self.arch == 'trans_enc':
+        if self.arch == 'cross_attn_trans_enc':
+            print("CROSS_ATTN_TRANS_ENC init")
+            seqTransEncoderLayer = CrossAttentionEncoderLayer(d_model=self.latent_dim,
+                                                              nhead=self.num_heads,
+                                                              dim_feedforward=self.ff_size,
+                                                              dropout=self.dropout,
+                                                              activation=self.activation)
+
+            self.seqTransEncoder = CrossAttentionEncoder(seqTransEncoderLayer,
+                                                         num_layers=self.num_layers)
+        elif self.arch == 'trans_enc':
             print("TRANS_ENC init")
             seqTransEncoderLayer = nn.TransformerEncoderLayer(d_model=self.latent_dim,
                                                               nhead=self.num_heads,
@@ -96,6 +184,19 @@ class MDM(nn.Module):
             self.gru = nn.GRU(self.latent_dim, self.latent_dim, num_layers=self.num_layers, batch_first=True)
         else:
             raise ValueError('Please choose correct architecture [trans_enc, trans_dec, gru]')
+
+        self.refiner = AutoregressiveRefiner(
+            njoints=self.njoints,
+            nfeats=self.nfeats,
+            latent_dim=self.latent_dim,
+            ff_size=self.ff_size,
+            num_layers=kargs.get('refiner_layers', 4), # Usually shallower than backbone
+            num_heads=self.num_heads,
+            dropout=self.dropout,
+            activation=self.activation,
+            n_modes=kargs.get('n_refiner_modes', 5),
+            data_rep=self.data_rep # Passes 'rot6d' or 'rot_vel' to reuse InputProcess logic
+        )
 
         self.embed_timestep = TimestepEmbedder(self.latent_dim, self.sequence_pos_encoder)
 
@@ -211,19 +312,28 @@ class MDM(nn.Module):
                 enc_text = y['text_embed']
             else:
                 enc_text = self.encode_text(y['text'])
+            
+            text_mask = None
             if type(enc_text) == tuple:
                 enc_text, text_mask = enc_text
                 if text_mask.shape[0] == 1 and bs > 1:  # casting mask for the single-prompt-for-all case
                     text_mask = torch.repeat_interleave(text_mask, bs, dim=0)
+
             text_emb = self.embed_text(self.mask_cond(enc_text, force_mask=force_mask))  # casting mask for the single-prompt-for-all case
             if self.emb_policy == 'add':
                 emb = text_emb + time_emb
-            else:
+            elif self.emb_policy == 'concat':
                 emb = torch.cat([time_emb, text_emb], dim=0)
                 text_mask = torch.cat([torch.zeros_like(text_mask[:, 0:1]), text_mask], dim=1)
+            elif self.emb_policy == 'none':
+                pass
+            else:
+                raise ValueError('Unknown emb_policy {}'.format(self.emb_policy))
+
         if 'action' in self.cond_mode:
             action_emb = self.embed_action(y['action'])
             emb = time_emb + self.mask_cond(action_emb, force_mask=force_mask)
+
         if self.cond_mode == 'no_cond': 
             # unconstrained
             emb = time_emb
@@ -246,7 +356,26 @@ class MDM(nn.Module):
                 step_mask = torch.zeros((bs, 1), dtype=torch.bool, device=x.device)
                 frames_mask = torch.cat([step_mask, frames_mask], dim=1)
 
-        if self.arch == 'trans_enc':
+        if self.arch == 'cross_attn_trans_enc':
+            xseq = self.sequence_pos_encoder(x)
+
+            # print(f"\n[MDM LEVEL] Checking Injection:")
+            # print(f"   > Motion Shape (xseq): {xseq.shape} (Should be [Seq, Batch, 512])")
+            # print(f"   > Time Shape (time_emb): {time_emb.shape} (Should be [1, Batch, 512])")
+            
+            # if text_emb is not None:
+            #     print(f"   > Text Shape (memory): {text_emb.shape} (Should be [Seq, Batch, 512])")
+            # else:
+            #     print(f"   > Text Shape: None")
+
+            output = self.seqTransEncoder(
+                xseq,
+                src_key_padding_mask=frames_mask,
+                memory=text_emb,
+                memory_key_padding_mask=text_mask,
+                time_emb=time_emb
+            )
+        elif self.arch == 'trans_enc':
             # adding the timestep embed
             xseq = torch.cat((emb, x), axis=0)  # [seqlen+1, bs, d]
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]

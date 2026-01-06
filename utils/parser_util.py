@@ -94,7 +94,7 @@ def add_diffusion_options(parser):
 def add_model_options(parser):
     group = parser.add_argument_group('model')
     group.add_argument("--arch", default='trans_enc',
-                       choices=['trans_enc', 'trans_dec', 'gru'], type=str,
+                       choices=['trans_enc', 'trans_dec', 'gru', 'cross_attn_trans_enc'], type=str,
                        help="Architecture types as reported in the paper.")
     group.add_argument("--text_encoder_type", default='clip',
                        choices=['clip', 'bert'], type=str, help="Text encoder type.")
@@ -120,6 +120,8 @@ def add_model_options(parser):
                        help="Pose embedding max length.")
     group.add_argument("--use_ema", action='store_true',
                     help="If True, will use EMA model averaging.")
+    group.add_argument("--emb_policy", default='add', choices=['concat', 'add', 'none'], type=str,
+                    help="How the text and time embeddings are processed.")
     
 
     group.add_argument("--multi_target_cond", action='store_true', help="If true, enable multi-target conditioning (aka Sigal's model).")

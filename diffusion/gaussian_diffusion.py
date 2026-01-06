@@ -1220,8 +1220,65 @@ class GaussianDiffusion:
         # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
+    
+    def gaussian_mog_loss(self, target, pi_logits, mu, sigma):
+        """Calculates Negative Log Likelihood for Mixture of Gaussians."""
+        target = target.unsqueeze(2).expand_as(mu)
+        var = sigma ** 2
+        log_scale = torch.log(sigma)
+        log_prob_modes = -0.5 * np.log(2 * np.pi) - log_scale - 0.5 * (target - mu).pow(2) / var
+        log_prob_modes = log_prob_modes.sum(dim=-1)
+        log_pi = torch.log_softmax(pi_logits, dim=-1)
+        nll = -torch.logsumexp(log_pi + log_prob_modes, dim=-1)
+        return nll.mean()
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, dataset=None):
+    def recover_hml_xyz(self, hml_vec, mean, std):
+        """
+        Recover Absolute XYZ positions from HumanML3D 263D feature vector.
+        Based on HumanML3D method (Sections 4.7 & 17).
+        """
+        # 1. De-normalize
+        # hml_vec: [Batch, 263, Frames] (after squeeze)
+        # mean/std: [1, 263, 1]
+        x = hml_vec * std + mean
+        
+        # 2. Extract Key Components
+        # [Batch, Features, Frames] -> Permute to [Batch, Frames, Features] for calc
+        x = x.permute(0, 2, 1)
+        
+        # Root Linear Velocity (XZ) is at indices 1:3
+        # Root Y Position is at index 3
+        # See Section 4.7: "root linear velocity in the XZ plane", "root height (Y coordinate)"
+        root_vel_xz = x[:, :, 1:3] # [B, T, 2]
+        root_y = x[:, :, 3:4]      # [B, T, 1]
+        
+        # Local Joint Positions (Indices 4 to 67) -> 21 joints * 3 coords
+        # See Section 4.7: "rotation-invariant joint positions (ric data, 21x3)"
+        local_joint_xyz = x[:, :, 4:67].view(x.shape[0], x.shape[1], 21, 3)
+        
+        # 3. Integrate Root Velocity to get Root Position
+        # We assume start at (0,0) and accumulate velocity
+        root_pos_xz = torch.cumsum(root_vel_xz, dim=1)
+        
+        # Combine [XZ] with [Y] -> [B, T, 1, 3]
+        root_pos = torch.cat([root_pos_xz[:, :, 0:1], root_y, root_pos_xz[:, :, 1:2]], dim=-1)
+        root_pos = root_pos.unsqueeze(2) # Add joint dim: [B, T, 1, 3]
+        
+        # 4. Add Root to Local Joints
+        # "Root-centered / canonicalized pose features" are relative to root.
+        # We reconstruct the full skeleton by concatenating the Root at index 0.
+        
+        # Absolute Joint Positions = Root Pos + Local Offsets
+        abs_joint_xyz = local_joint_xyz + root_pos 
+        
+        # Concatenate Root Joint (which is just 'root_pos')
+        # Final Shape: [B, T, 22, 3]
+        skeleton_xyz = torch.cat([root_pos, abs_joint_xyz], dim=2)
+        
+        # Permute back to [Batch, Joints, 3, Frames] for your loss function
+        return skeleton_xyz.permute(0, 2, 3, 1).contiguous()
+
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, dataset=None, refiner=None):
         """
         Compute training losses for a single timestep.
 
@@ -1234,6 +1291,10 @@ class GaussianDiffusion:
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
+
+        if not hasattr(self, 'step_count'):
+            self.step_count = 0
+        self.step_count += 1
 
         # enc = model.model._modules['module']
         enc = model.model
@@ -1345,13 +1406,132 @@ class GaussianDiffusion:
                                             model_kwargs['y']['lengths'], dataset.t2m_dataset.opt.joints_num, model.all_goal_joint_names, 
                                             model_kwargs['y']['target_joint_names'], model_kwargs['y']['is_heading'])
                 terms["target_loc"] = masked_goal_l2(pred_target, ref_target, model_kwargs['y'], model.all_goal_joint_names)
-                            
 
-            terms["loss"] = terms["rot_mse"] + terms.get('vb', 0.) +\
-                            (self.lambda_vel * terms.get('vel_mse', 0.)) +\
-                            (self.lambda_rcxyz * terms.get('rcxyz_mse', 0.)) + \
-                            (self.lambda_target_loc * terms.get('target_loc', 0.)) + \
-                            (self.lambda_fc * terms.get('fc', 0.))
+            self.virtual_observation = True
+            if self.virtual_observation:
+                if self.model_mean_type == ModelMeanType.START_X:
+                    pred_x0 = model_output
+                elif self.model_mean_type == ModelMeanType.EPSILON:
+                    # If model predicts noise, we must convert it to x_start first
+                    pred_x0 = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+                else:
+                    raise NotImplementedError("Virtual observation requires START_X or EPSILON prediction")                            
+                
+                timestep_1 = torch.tensor([1], device=pred_x0.device)
+                x_1 = self.q_sample(pred_x0, timestep_1, noise=noise)
+
+                posterior_mean_x_1, _, _ = self.q_posterior_mean_variance(
+                    x_start=pred_x0, 
+                    x_t=x_1, 
+                    t=timestep_1
+                )
+
+                # --- 2. Refiner & Tripartite Losses ---
+                if refiner is not None:
+                    # A. Refiner Forward
+                    pi, mu, sigma = refiner(x_past=x_start, z_plan=model_output)
+                    
+                    # B. L_recon (Likelihood Loss)
+                    bs, njoints, nfeats, nframes = x_start.shape
+                    target_flat = x_start.permute(0, 3, 1, 2).reshape(bs, nframes, njoints * nfeats)
+                    l_recon = self.gaussian_mog_loss(target_flat, pi, mu, sigma)
+                    terms["l_recon"] = l_recon
+                    
+                    # C. L_VO (Virtual Observation / Physical Loss)
+                    x_phys_flat = refiner.straight_through_sample(pi, mu)
+                    
+                    # [FIX 1] .contiguous() fixes the memory layout crash
+                    x_phys = x_phys_flat.view(bs, nframes, njoints, nfeats).permute(0, 2, 3, 1).contiguous()
+                    
+                    # [FIX 2] Adaptive Shape Check
+                    # Detects if data is actually a large 263D vector (hml_vec) 
+                    # instead of the expected [22, 6] rot6d format.
+                    is_hml_vec = (x_phys.shape[1] == 263) or (x_phys.shape[2] == 263)
+                    l_vo = 0.0
+
+                    if is_hml_vec:
+                        # 1. Handle Dimensions: [B, 263, 1, T] -> [B, 263, T]
+                        if x_phys.shape[2] == 1: x_phys = x_phys.squeeze(2)
+                        if x_start.shape[2] == 1: x_start_sq = x_start.squeeze(2)
+                        else: x_start_sq = x_start
+
+                        # 2. Get Statistics for De-normalization
+                        # We need these to recover real meters/seconds
+                        if dataset is not None and hasattr(dataset, 'mean') and hasattr(dataset, 'std'):
+                            # Ensure shapes align: [1, 263, 1]
+                            mean = torch.from_numpy(dataset.mean).to(x_phys.device).view(1, -1, 1)
+                            std = torch.from_numpy(dataset.std).to(x_phys.device).view(1, -1, 1)
+                            
+                            # 3. Recover XYZ using the new function
+                            # x_phys_xyz shape will be [Batch, 22, 3, Frames]
+                            x_phys_xyz = self.recover_hml_xyz(x_phys, mean, std)
+                            target_xyz = self.recover_hml_xyz(x_start_sq, mean, std)
+
+                            # --- SANITY CHECKS (Run once and then comment out) ---
+                            if self.step_count % 100 == 0: # Adjust frequency as needed
+                                print(f"\n[Sanity Check] Step {self.step_count}")
+                                
+                                # 1. Shape Check
+                                # Expect: [Batch, 22, 3, Frames]
+                                print(f"  > Output Shape: {x_phys_xyz.shape}") 
+                                if x_phys_xyz.shape[1] != 22 or x_phys_xyz.shape[2] != 3:
+                                    print("  !! CRITICAL WARNING: Shape mismatch! Expected [B, 22, 3, T]")
+
+                                # 2. Bone Length Consistency Check
+                                # If our velocity integration is wrong, bones will stretch/shrink over time.
+                                # We check the Left Knee (idx 4) -> Left Ankle (idx 7) bone.
+                                # Indices based on HumanML3D standard.
+                                lknee = x_phys_xyz[:, 4, :, :] # [B, 3, T]
+                                lankle = x_phys_xyz[:, 7, :, :]
+                                
+                                # Calculate Euclidean distance for every frame
+                                bone_len = torch.norm(lknee - lankle, dim=1) # [B, T]
+                                
+                                # The standard deviation over time should be close to 0 (rigid bone)
+                                bone_std = bone_len.std(dim=1).mean().item()
+                                bone_avg = bone_len.mean().item()
+                                
+                                print(f"  > Left Shin Length: {bone_avg:.4f} (meters approx)")
+                                print(f"  > Bone Length StdDev: {bone_std:.6f}")
+                                
+                                if bone_std > 0.01:
+                                    print("  !! WARNING: Bones are stretching! Velocity integration might be wrong.")
+                                else:
+                                    print("  > Bones are rigid. Integration looks good.")
+
+                                # 3. Floor Position Check
+                                # Check the lowest Y value. It should be near 0 (ground level).
+                                # If it's -500 or +500, de-normalization is broken.
+                                min_y = x_phys_xyz[:, :, 1, :].min().item()
+                                max_y = x_phys_xyz[:, :, 1, :].max().item()
+                                print(f"  > Vertical Range (Y): Min={min_y:.3f}, Max={max_y:.3f}")
+                                
+                                if min_y < -0.5:
+                                    print("  !! WARNING: Character is sinking under the floor.")
+                            
+                            # 4. Calculate Foot Contact Loss
+                            l_vo = self.fc_loss_rot_repr(target_xyz, x_phys_xyz, mask)
+                        else:
+                            # Fallback if no stats available (loss is 0)
+                            l_vo = 0.0
+
+                    elif self.data_rep == 'rot6d':
+                        x_phys_xyz = get_xyz(x_phys)
+                        target_xyz = get_xyz(x_start)
+                        l_vo = self.fc_loss_rot_repr(target_xyz, x_phys_xyz, mask)
+
+                    terms["l_vo"] = l_vo
+
+                    mdm_loss = terms["rot_mse"] + terms["l_recon"] + terms["l_vo"]
+            else:
+                # --- 1. Calculate Base MDM Loss ---
+                mdm_loss = terms["rot_mse"] + terms.get('vb', 0.) +\
+                                (self.lambda_vel * terms.get('vel_mse', 0.)) +\
+                                (self.lambda_rcxyz * terms.get('rcxyz_mse', 0.)) + \
+                                (self.lambda_target_loc * terms.get('target_loc', 0.)) + \
+                                (self.lambda_fc * terms.get('fc', 0.))
+                
+            terms["loss"] = mdm_loss
 
         else:
             raise NotImplementedError(self.loss_type)
