@@ -1429,7 +1429,11 @@ class GaussianDiffusion:
                 # --- 2. Refiner & Tripartite Losses ---
                 if refiner is not None:
                     # A. Refiner Forward
-                    pi, mu, sigma = refiner(x_past=x_start, z_plan=model_output, y=model_kwargs['y'])
+                    pi, mu, sigma = refiner(
+                        x_past=x_start,
+                        z_plan=posterior_mean_x_1,
+                        y=model_kwargs['y']['text_embed']
+                    )
                     
                     # B. L_recon (Likelihood Loss)
                     bs, njoints, nfeats, nframes = x_start.shape
