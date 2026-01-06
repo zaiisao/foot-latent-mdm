@@ -9,7 +9,7 @@ from utils.misc import WeightedSum
 from .transformer import CrossAttentionEncoder, CrossAttentionEncoderLayer
 
 class AutoregressiveRefiner(nn.Module):
-    def __init__(self, njoints, nfeats, latent_dim=256, ff_size=1024, num_layers=4, num_heads=4, 
+    def __init__(self, njoints, nfeats, cond_dim=512, latent_dim=256, ff_size=1024, num_layers=4, num_heads=4, 
                  dropout=0.1, activation="gelu", n_modes=5, data_rep='rot6d', **kargs):
         super().__init__()
         
@@ -23,6 +23,9 @@ class AutoregressiveRefiner(nn.Module):
         # The MDM output (z_plan) is also raw skeletal data, so it needs the same projection
         self.plan_embedding = InputProcess(data_rep, input_feats, latent_dim)
         self.sequence_pos_encoder = PositionalEncoding(latent_dim, dropout)
+
+        self.cond_projection = nn.Linear(cond_dim, latent_dim)
+        self.cond_dropout = nn.Dropout(dropout)
         
         decoder_layer = nn.TransformerDecoderLayer(d_model=latent_dim,
                                                    nhead=num_heads,
@@ -36,11 +39,22 @@ class AutoregressiveRefiner(nn.Module):
         self.head_mu = nn.Linear(latent_dim, n_modes * input_feats)
         self.head_sigma = nn.Linear(latent_dim, n_modes * input_feats)
 
-    def forward(self, x_past, z_plan):
+    def forward(self, x_past, z_plan, y=None):
         x_emb = self.input_process(x_past)
         x_emb = self.sequence_pos_encoder(x_emb)
 
-        memory = self.plan_embedding(z_plan)
+        plan_emb = self.plan_embedding(z_plan)
+        if y is not None:
+            # y is usually [Batch, cond_dim]
+            y_emb = self.cond_projection(y)
+            y_emb = self.cond_dropout(y_emb)
+
+            y_emb = y_emb.unsqueeze(0) 
+
+            memory = torch.cat([y_emb, plan_emb], dim=0) 
+        else:
+            memory = plan_emb
+
         memory = self.sequence_pos_encoder(memory)
 
         seq_len = x_emb.shape[0]

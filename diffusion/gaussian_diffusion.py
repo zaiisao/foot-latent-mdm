@@ -1429,7 +1429,7 @@ class GaussianDiffusion:
                 # --- 2. Refiner & Tripartite Losses ---
                 if refiner is not None:
                     # A. Refiner Forward
-                    pi, mu, sigma = refiner(x_past=x_start, z_plan=model_output)
+                    pi, mu, sigma = refiner(x_past=x_start, z_plan=model_output, y=model_kwargs['y'])
                     
                     # B. L_recon (Likelihood Loss)
                     bs, njoints, nfeats, nframes = x_start.shape
@@ -1440,10 +1440,8 @@ class GaussianDiffusion:
                     # C. L_VO (Virtual Observation / Physical Loss)
                     x_phys_flat = refiner.straight_through_sample(pi, mu)
                     
-                    # [FIX 1] .contiguous() fixes the memory layout crash
                     x_phys = x_phys_flat.view(bs, nframes, njoints, nfeats).permute(0, 2, 3, 1).contiguous()
-                    
-                    # [FIX 2] Adaptive Shape Check
+
                     # Detects if data is actually a large 263D vector (hml_vec) 
                     # instead of the expected [22, 6] rot6d format.
                     is_hml_vec = (x_phys.shape[1] == 263) or (x_phys.shape[2] == 263)
