@@ -87,6 +87,20 @@ class Rotation2xyz:
             x_xyz = x_xyz + x_translations[:, None, :, :]
 
         if get_rotations_back:
-            return x_xyz, rotations, global_orient
+            all_rot_masked = torch.cat((global_orient, rotations), dim=1)
+
+            # We create an empty buffer of the full shape [Batch, Time, 24, 3, 3]
+            full_rotations = torch.empty(nsamples, time, 24, 3, 3, device=x.device, dtype=x.dtype)
+            
+            # Fill the valid spots with our calculated matrices
+            full_rotations[mask] = all_rot_masked
+            
+            # Fill invalid spots with Identity matrix (so math doesn't break)
+            full_rotations[~mask] = torch.eye(3, device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)
+
+            # Permute to [Batch, Joints, 3, 3, Time] (matches x_xyz format)
+            full_rotations = full_rotations.permute(0, 2, 3, 4, 1).contiguous()
+
+            return x_xyz, full_rotations
         else:
             return x_xyz

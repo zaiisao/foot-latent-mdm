@@ -19,6 +19,8 @@ from data_loaders.humanml.scripts import motion_process
 from utils.loss_util import masked_l2, masked_goal_l2
 from data_loaders.humanml.scripts.motion_process import get_target_location
 
+from .foot_contact import SMPLGeometryWrapper
+
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
     Get a pre-defined beta schedule for the given name.
@@ -203,7 +205,6 @@ class GaussianDiffusion:
 
         # self.l2_loss = lambda a, b: (a - b) ** 2  # th.nn.MSELoss(reduction='none')  # must be None for handling mask later on.
         self.masked_l2 = masked_l2
-
 
 
     def q_mean_variance(self, x_start, t):
@@ -1311,6 +1312,10 @@ class GaussianDiffusion:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
 
+        if 'text' in model_kwargs['y'].keys() and not 'text_embed' in model_kwargs['y'].keys():
+            # encoding once instead of each iteration saves lots of time
+            model_kwargs['y']['text_embed'] = model.encode_text(model_kwargs['y']['text'])
+
         terms = {}
 
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
@@ -1511,8 +1516,68 @@ class GaussianDiffusion:
                                 if min_y < -0.5:
                                     print("  !! WARNING: Character is sinking under the floor.")
                             
-                            # 4. Calculate Foot Contact Loss
-                            l_vo = self.fc_loss_rot_repr(target_xyz, x_phys_xyz, mask)
+                            # 4. Calculate Foot Contact Loss (Virtual Observation)
+                            # Replaced fc_loss_rot_repr with SMPLGeometryWrapper logic
+                            
+                            # Instantiate wrapper (ensure it's on the correct device)
+                            smpl_geom = SMPLGeometryWrapper().to(x_phys_xyz.device)
+                            
+                            # A. Get Virtual Landmarks using Fixed Offsets
+                            # x_phys_xyz: [Batch, 22, 3, Frames]
+                            landmarks = smpl_geom.get_landmarks_from_skeleton(x_phys_xyz)
+                            
+                            # B. Calculate Metrics
+                            heights = smpl_geom.compute_heights(landmarks)
+                            velocities = smpl_geom.compute_tangential_velocities(landmarks) # [B, T-1]
+                            
+                            # C. Calculate Ground Truth Contact Masks (from target_xyz)
+                            # We use GT velocity to determine when the foot *should* be planted.
+                            # Indices: 7=L_Ankle, 8=R_Ankle
+                            gt_l_ankle = target_xyz[:, 7, :, :].permute(0, 2, 1) # [B, T, 3]
+                            gt_r_ankle = target_xyz[:, 8, :, :].permute(0, 2, 1)
+                            
+                            # Calculate GT velocities
+                            gt_l_vel = torch.norm(gt_l_ankle[:, 1:] - gt_l_ankle[:, :-1], dim=-1)
+                            gt_r_vel = torch.norm(gt_r_ankle[:, 1:] - gt_r_ankle[:, :-1], dim=-1)
+                            
+                            # Heuristic Contact Threshold (e.g., < 2mm per frame)
+                            contact_thresh = 0.002
+                            gt_l_contact = gt_l_vel < contact_thresh
+                            gt_r_contact = gt_r_vel < contact_thresh
+                            
+                            # D. Compute Physical Losses
+                            l_vo_height = 0.0
+                            l_vo_skate = 0.0
+                            skate_weight = 1.0
+
+                            if self.step_count % 100 == 0: # Print every 100 steps to avoid spam
+                                print(f"\n[DEBUG Step {self.step_count}] Foot Contact Loss Stats:")
+                                print(f"  > Contact Thresh: {contact_thresh}")
+                                print(f"  > GT L_Contact Ratio: {gt_l_contact.float().mean():.4f}")
+                                print(f"  > GT R_Contact Ratio: {gt_r_contact.float().mean():.4f}")
+                            
+                            for name in landmarks.keys():
+                                # 1. Penetration Loss: Penalize negative height
+                                # ReLU(-h) is positive when h is negative (under floor)
+                                l_vo_height += torch.mean(torch.relu(-heights[name]))
+                                
+                                # 2. Skating Loss: Penalize velocity when GT says contact
+                                # Determine which foot this landmark belongs to
+                                if 'L_' in name:
+                                    contact_mask = gt_l_contact.float()
+                                else:
+                                    contact_mask = gt_r_contact.float()
+                                
+                                # Velocities are length T-1, match mask length
+                                # We treat the contact constraint as active on the velocity between frames
+                                curr_vel = velocities[name] # [B, T-1]
+                                curr_mask = contact_mask # [B, T-1]
+                                
+                                l_vo_skate += torch.mean(curr_vel * curr_mask)
+
+                            # Combine terms (Weights can be tuned, e.g., 10.0 for skate)
+                            l_vo = l_vo_height + (l_vo_skate * skate_weight)
+
                         else:
                             # Fallback if no stats available (loss is 0)
                             l_vo = 0.0

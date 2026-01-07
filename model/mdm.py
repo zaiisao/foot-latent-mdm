@@ -49,7 +49,8 @@ class AutoregressiveRefiner(nn.Module):
             y_emb = self.cond_projection(y)
             y_emb = self.cond_dropout(y_emb)
 
-            y_emb = y_emb.unsqueeze(0) 
+            if y_emb.ndim == 2:
+                y_emb = y_emb.unsqueeze(0)
 
             memory = torch.cat([y_emb, plan_emb], dim=0) 
         else:
