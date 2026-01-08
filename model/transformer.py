@@ -144,6 +144,8 @@ class CrossAttentionEncoderLayer(Module):
         src = self.norm1(src)
 
         if memory is not None:
+            # JA: This is the cross-attention block which we use to inject the text conditioning
+            # as per Latent Diffusion Models (Rombach et al., 2022).
             src2 = self.cross_attn(src, memory, memory, 
                                    key_padding_mask=memory_key_padding_mask)[0]
             src = src + self.dropout_cross(src2)

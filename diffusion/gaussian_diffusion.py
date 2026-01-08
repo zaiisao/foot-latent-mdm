@@ -1310,10 +1310,13 @@ class GaussianDiffusion:
             model_kwargs = {}
         if noise is None:
             noise = th.randn_like(x_start)
+        
+        # JA: Forward diffusion process: q(x_t | x_0). Noisify the clean motion x_start to step t.
         x_t = self.q_sample(x_start, t, noise=noise)
 
         if 'text' in model_kwargs['y'].keys() and not 'text_embed' in model_kwargs['y'].keys():
             # encoding once instead of each iteration saves lots of time
+            # Added by JA: the text was usually encoded within the MDM model, but we need it here for the refiner
             model_kwargs['y']['text_embed'] = model.encode_text(model_kwargs['y']['text'])
 
         terms = {}
@@ -1330,7 +1333,11 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+            # JA: In our experiment, the loss type is MSE
+            # The arch of the model is 'cross_attn_trans_enc' which does not concatenate the
+            # embedding at the start of the data sequence but rather provides it as cross
+            # attention input.
+            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs) # JA: Get \hat{x}_\theta^0(t)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
@@ -1358,7 +1365,7 @@ class GaussianDiffusion:
                 ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
                     x_start=x_start, x_t=x_t, t=t
                 )[0],
-                ModelMeanType.START_X: x_start,
+                ModelMeanType.START_X: x_start, # JA: Model mean type is START_X (x_0) in our experiments
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape  # [bs, njoints, nfeats, nframes]
@@ -1422,8 +1429,9 @@ class GaussianDiffusion:
                 else:
                     raise NotImplementedError("Virtual observation requires START_X or EPSILON prediction")                            
                 
+                # JA: To simultaneously train the modules used when t=1, we noise the denoised prediction latent
                 timestep_1 = torch.tensor([1], device=pred_x0.device)
-                x_1 = self.q_sample(pred_x0, timestep_1, noise=noise)
+                x_1 = self.q_sample(pred_x0, timestep_1, noise=noise) # JA: We are sampling \hat{z}_\theta
 
                 posterior_mean_x_1, _, _ = self.q_posterior_mean_variance(
                     x_start=pred_x0, 
@@ -1434,19 +1442,27 @@ class GaussianDiffusion:
                 # --- 2. Refiner & Tripartite Losses ---
                 if refiner is not None:
                     # A. Refiner Forward
+                    # JA: The Refiner (Decoder) takes the noisy plan (z_plan) and text condition (y) to
+                    # autoregressively generate the motion
                     pi, mu, sigma = refiner(
                         x_past=x_start,
                         z_plan=posterior_mean_x_1,
                         y=model_kwargs['y']['text_embed']
-                    )
+                    ) # JA: This refiner plays the role of p_\psi
                     
                     # B. L_recon (Likelihood Loss)
                     bs, njoints, nfeats, nframes = x_start.shape
                     target_flat = x_start.permute(0, 3, 1, 2).reshape(bs, nframes, njoints * nfeats)
+
+                    # JA: Maximize the log-likelihood of the real motion (target) under the predicted Mixture
+                    # of Gaussians distribution
                     l_recon = self.gaussian_mog_loss(target_flat, pi, mu, sigma)
                     terms["l_recon"] = l_recon
                     
                     # C. L_VO (Virtual Observation / Physical Loss)
+                    # JA: This is the straight-through estimator, which creates a sample that is effectively
+                    # the "Hard Mean" (for the forward pass/physics) but allows gradients to flow through the
+                    # "Soft Mean" (for the backward pass)
                     x_phys_flat = refiner.straight_through_sample(pi, mu)
                     
                     x_phys = x_phys_flat.view(bs, nframes, njoints, nfeats).permute(0, 2, 3, 1).contiguous()
@@ -1470,6 +1486,10 @@ class GaussianDiffusion:
                             std = torch.from_numpy(dataset.std).to(x_phys.device).view(1, -1, 1)
                             
                             # 3. Recover XYZ using the new function
+                            # JA: Critical Step: The L_VO loss requires absolute (x,y,z) coordinates in meters. 
+                            # The model outputs normalized features (relative velocities, etc.). 
+                            # We must manually de-normalize and integrate velocities to reconstruct the skeleton
+                            # for physics checks.
                             # x_phys_xyz shape will be [Batch, 22, 3, Frames]
                             x_phys_xyz = self.recover_hml_xyz(x_phys, mean, std)
                             target_xyz = self.recover_hml_xyz(x_start_sq, mean, std)
@@ -1520,6 +1540,8 @@ class GaussianDiffusion:
                             # Replaced fc_loss_rot_repr with SMPLGeometryWrapper logic
                             
                             # Instantiate wrapper (ensure it's on the correct device)
+                            # JA: Wrapper handles the SMPL mesh topology to find specific vertices (toe/heel)
+                            # for collision checks
                             smpl_geom = SMPLGeometryWrapper().to(x_phys_xyz.device)
                             
                             # A. Get Virtual Landmarks using Fixed Offsets
@@ -1562,6 +1584,8 @@ class GaussianDiffusion:
                                 l_vo_height += torch.mean(torch.relu(-heights[name]))
                                 
                                 # 2. Skating Loss: Penalize velocity when GT says contact
+                                # JA: Physical Constraint 2: Foot Skating. If GT says foot is planted (mask=1), velocity must be 0.
+
                                 # Determine which foot this landmark belongs to
                                 if 'L_' in name:
                                     contact_mask = gt_l_contact.float()

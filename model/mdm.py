@@ -40,9 +40,11 @@ class AutoregressiveRefiner(nn.Module):
         self.head_sigma = nn.Linear(latent_dim, n_modes * input_feats)
 
     def forward(self, x_past, z_plan, y=None):
+        # JA: x_past (x^{(<i)}), or t sequence of frames generated so far, is processed using the MDM input process
         x_emb = self.input_process(x_past)
         x_emb = self.sequence_pos_encoder(x_emb)
 
+        # JA: z_plan (z_\theta(t)), or the "hint" or coarse motion plan (context) is also processed in the same way as x_past
         plan_emb = self.plan_embedding(z_plan)
         if y is not None:
             # y is usually [Batch, cond_dim]
@@ -52,20 +54,23 @@ class AutoregressiveRefiner(nn.Module):
             if y_emb.ndim == 2:
                 y_emb = y_emb.unsqueeze(0)
 
+            # JA: The "Memory" is what the Transformer attends to via Cross-Attention, combining the Style/
+            # Text Condition (y) and the Motion Plan (z_plan) into a single sequence.
             memory = torch.cat([y_emb, plan_emb], dim=0) 
         else:
             memory = plan_emb
 
+        # JA: We must add positional information to the plan/memory so the model can know the temporal order
         memory = self.sequence_pos_encoder(memory)
 
         seq_len = x_emb.shape[0]
         tgt_mask = self.generate_square_subsequent_mask(seq_len).to(x_emb.device)
         out = self.seqTransDecoder(tgt=x_emb, memory=memory, tgt_mask=tgt_mask)
          
-        out = out.permute(1, 0, 2)
-        pi = self.head_pi(out)
-        mu = self.head_mu(out)
-        log_sigma = self.head_sigma(out)
+        out = out.permute(1, 0, 2) # [Seq, Batch, Dim] -> [Batch, Seq, Dim]
+        pi = self.head_pi(out) # JA: This is the same as \pi_{\psi, k}
+        mu = self.head_mu(out) # JA: This is the same as \mu_{\psi, k}
+        log_sigma = self.head_sigma(out) # JA: Used to compute \sigma_{\psi, k}
         
         bs, seq, _ = out.shape
         mu = mu.view(bs, seq, self.n_modes, -1)
@@ -91,6 +96,10 @@ class AutoregressiveRefiner(nn.Module):
         pi_hard = F.one_hot(k_star, num_classes=self.n_modes).float()
         
         # 3. Straight-Through Trick: Forward=Hard, Backward=Soft
+        # JA: During the forward pass,
+        #   pi_ste evaluates to pi_hard; therefore x_out becomes the mean of the best mode ($\mu_{k^*}$).
+        # During the backward pass,
+        #   The detach() blocks gradients on the hard selection, and grads flow through pi_soft.
         pi_ste = (pi_hard - pi_soft).detach() + pi_soft
         
         # 4. Select the corresponding Mean (mu)
@@ -200,6 +209,7 @@ class MDM(nn.Module):
         else:
             raise ValueError('Please choose correct architecture [trans_enc, trans_dec, gru]')
 
+        # JA: This is for the refiner loss
         self.refiner = AutoregressiveRefiner(
             njoints=self.njoints,
             nfeats=self.nfeats,
