@@ -1554,10 +1554,9 @@ class GaussianDiffusion:
                             
                             # C. Calculate Ground Truth Contact Masks (from target_xyz)
                             # We use GT velocity to determine when the foot *should* be planted.
-                            # Indices: 7=L_Ankle, 8=R_Ankle
-                            gt_l_ankle = target_xyz[:, 7, :, :].permute(0, 2, 1) # [B, T, 3]
-                            gt_r_ankle = target_xyz[:, 8, :, :].permute(0, 2, 1)
-                            
+                            gt_l_ankle = target_xyz[:, 10, :, :].permute(0, 2, 1)
+                            gt_r_ankle = target_xyz[:, 11, :, :].permute(0, 2, 1)
+             
                             # Calculate GT velocities
                             gt_l_vel = torch.norm(gt_l_ankle[:, 1:] - gt_l_ankle[:, :-1], dim=-1)
                             gt_r_vel = torch.norm(gt_r_ankle[:, 1:] - gt_r_ankle[:, :-1], dim=-1)
