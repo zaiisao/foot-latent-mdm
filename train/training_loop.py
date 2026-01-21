@@ -326,7 +326,8 @@ class TrainLoop:
                 micro,  # [bs, ch, image_size, image_size]
                 t,  # [bs](int) sampled timesteps
                 model_kwargs=micro_cond,
-                dataset=self.data.dataset
+                dataset=self.data.dataset,
+                refiner=self.model.refiner,
             )
 
             if last_batch or not self.use_ddp:

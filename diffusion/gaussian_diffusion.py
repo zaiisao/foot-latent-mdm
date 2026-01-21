@@ -19,6 +19,8 @@ from data_loaders.humanml.scripts import motion_process
 from utils.loss_util import masked_l2, masked_goal_l2
 from data_loaders.humanml.scripts.motion_process import get_target_location
 
+from .foot_contact import SMPLGeometryWrapper
+
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
     Get a pre-defined beta schedule for the given name.
@@ -203,7 +205,6 @@ class GaussianDiffusion:
 
         # self.l2_loss = lambda a, b: (a - b) ** 2  # th.nn.MSELoss(reduction='none')  # must be None for handling mask later on.
         self.masked_l2 = masked_l2
-
 
 
     def q_mean_variance(self, x_start, t):
@@ -1220,8 +1221,65 @@ class GaussianDiffusion:
         # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
+    
+    def gaussian_mog_loss(self, target, pi_logits, mu, sigma):
+        """Calculates Negative Log Likelihood for Mixture of Gaussians."""
+        target = target.unsqueeze(2).expand_as(mu)
+        var = sigma ** 2
+        log_scale = torch.log(sigma)
+        log_prob_modes = -0.5 * np.log(2 * np.pi) - log_scale - 0.5 * (target - mu).pow(2) / var
+        log_prob_modes = log_prob_modes.sum(dim=-1)
+        log_pi = torch.log_softmax(pi_logits, dim=-1)
+        nll = -torch.logsumexp(log_pi + log_prob_modes, dim=-1)
+        return nll.mean()
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, dataset=None):
+    def recover_hml_xyz(self, hml_vec, mean, std):
+        """
+        Recover Absolute XYZ positions from HumanML3D 263D feature vector.
+        Based on HumanML3D method (Sections 4.7 & 17).
+        """
+        # 1. De-normalize
+        # hml_vec: [Batch, 263, Frames] (after squeeze)
+        # mean/std: [1, 263, 1]
+        x = hml_vec * std + mean
+        
+        # 2. Extract Key Components
+        # [Batch, Features, Frames] -> Permute to [Batch, Frames, Features] for calc
+        x = x.permute(0, 2, 1)
+        
+        # Root Linear Velocity (XZ) is at indices 1:3
+        # Root Y Position is at index 3
+        # See Section 4.7: "root linear velocity in the XZ plane", "root height (Y coordinate)"
+        root_vel_xz = x[:, :, 1:3] # [B, T, 2]
+        root_y = x[:, :, 3:4]      # [B, T, 1]
+        
+        # Local Joint Positions (Indices 4 to 67) -> 21 joints * 3 coords
+        # See Section 4.7: "rotation-invariant joint positions (ric data, 21x3)"
+        local_joint_xyz = x[:, :, 4:67].view(x.shape[0], x.shape[1], 21, 3)
+        
+        # 3. Integrate Root Velocity to get Root Position
+        # We assume start at (0,0) and accumulate velocity
+        root_pos_xz = torch.cumsum(root_vel_xz, dim=1)
+        
+        # Combine [XZ] with [Y] -> [B, T, 1, 3]
+        root_pos = torch.cat([root_pos_xz[:, :, 0:1], root_y, root_pos_xz[:, :, 1:2]], dim=-1)
+        root_pos = root_pos.unsqueeze(2) # Add joint dim: [B, T, 1, 3]
+        
+        # 4. Add Root to Local Joints
+        # "Root-centered / canonicalized pose features" are relative to root.
+        # We reconstruct the full skeleton by concatenating the Root at index 0.
+        
+        # Absolute Joint Positions = Root Pos + Local Offsets
+        abs_joint_xyz = local_joint_xyz + root_pos 
+        
+        # Concatenate Root Joint (which is just 'root_pos')
+        # Final Shape: [B, T, 22, 3]
+        skeleton_xyz = torch.cat([root_pos, abs_joint_xyz], dim=2)
+        
+        # Permute back to [Batch, Joints, 3, Frames] for your loss function
+        return skeleton_xyz.permute(0, 2, 3, 1).contiguous()
+
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, dataset=None, refiner=None):
         """
         Compute training losses for a single timestep.
 
@@ -1234,6 +1292,10 @@ class GaussianDiffusion:
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
+
+        if not hasattr(self, 'step_count'):
+            self.step_count = 0
+        self.step_count += 1
 
         # enc = model.model._modules['module']
         enc = model.model
@@ -1248,7 +1310,14 @@ class GaussianDiffusion:
             model_kwargs = {}
         if noise is None:
             noise = th.randn_like(x_start)
+        
+        # JA: Forward diffusion process: q(x_t | x_0). Noisify the clean motion x_start to step t.
         x_t = self.q_sample(x_start, t, noise=noise)
+
+        if 'text' in model_kwargs['y'].keys() and not 'text_embed' in model_kwargs['y'].keys():
+            # encoding once instead of each iteration saves lots of time
+            # Added by JA: the text was usually encoded within the MDM model, but we need it here for the refiner
+            model_kwargs['y']['text_embed'] = model.encode_text(model_kwargs['y']['text'])
 
         terms = {}
 
@@ -1264,7 +1333,11 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+            # JA: In our experiment, the loss type is MSE
+            # The arch of the model is 'cross_attn_trans_enc' which does not concatenate the
+            # embedding at the start of the data sequence but rather provides it as cross
+            # attention input.
+            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs) # JA: Get \hat{x}_\theta^0(t)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
@@ -1292,7 +1365,7 @@ class GaussianDiffusion:
                 ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
                     x_start=x_start, x_t=x_t, t=t
                 )[0],
-                ModelMeanType.START_X: x_start,
+                ModelMeanType.START_X: x_start, # JA: Model mean type is START_X (x_0) in our experiments
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape  # [bs, njoints, nfeats, nframes]
@@ -1345,13 +1418,210 @@ class GaussianDiffusion:
                                             model_kwargs['y']['lengths'], dataset.t2m_dataset.opt.joints_num, model.all_goal_joint_names, 
                                             model_kwargs['y']['target_joint_names'], model_kwargs['y']['is_heading'])
                 terms["target_loc"] = masked_goal_l2(pred_target, ref_target, model_kwargs['y'], model.all_goal_joint_names)
-                            
 
-            terms["loss"] = terms["rot_mse"] + terms.get('vb', 0.) +\
-                            (self.lambda_vel * terms.get('vel_mse', 0.)) +\
-                            (self.lambda_rcxyz * terms.get('rcxyz_mse', 0.)) + \
-                            (self.lambda_target_loc * terms.get('target_loc', 0.)) + \
-                            (self.lambda_fc * terms.get('fc', 0.))
+            self.virtual_observation = True
+            if self.virtual_observation:
+                if self.model_mean_type == ModelMeanType.START_X:
+                    pred_x0 = model_output
+                elif self.model_mean_type == ModelMeanType.EPSILON:
+                    # If model predicts noise, we must convert it to x_start first
+                    pred_x0 = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+                else:
+                    raise NotImplementedError("Virtual observation requires START_X or EPSILON prediction")                            
+                
+                # JA: To simultaneously train the modules used when t=1, we noise the denoised prediction latent
+                timestep_1 = torch.tensor([1], device=pred_x0.device)
+                x_1 = self.q_sample(pred_x0, timestep_1, noise=noise) # JA: We are sampling \hat{z}_\theta
+
+                posterior_mean_x_1, _, _ = self.q_posterior_mean_variance(
+                    x_start=pred_x0, 
+                    x_t=x_1, 
+                    t=timestep_1
+                )
+
+                # --- 2. Refiner & Tripartite Losses ---
+                if refiner is not None:
+                    # A. Refiner Forward
+                    # JA: The Refiner (Decoder) takes the noisy plan (z_plan) and text condition (y) to
+                    # autoregressively generate the motion
+                    pi, mu, sigma = refiner(
+                        x_past=x_start,
+                        z_plan=posterior_mean_x_1,
+                        y=model_kwargs['y']['text_embed']
+                    ) # JA: This refiner plays the role of p_\psi
+                    
+                    # B. L_recon (Likelihood Loss)
+                    bs, njoints, nfeats, nframes = x_start.shape
+                    target_flat = x_start.permute(0, 3, 1, 2).reshape(bs, nframes, njoints * nfeats)
+
+                    # JA: Maximize the log-likelihood of the real motion (target) under the predicted Mixture
+                    # of Gaussians distribution
+                    l_recon = self.gaussian_mog_loss(target_flat, pi, mu, sigma)
+                    terms["l_recon"] = l_recon
+                    
+                    # C. L_VO (Virtual Observation / Physical Loss)
+                    # JA: This is the straight-through estimator, which creates a sample that is effectively
+                    # the "Hard Mean" (for the forward pass/physics) but allows gradients to flow through the
+                    # "Soft Mean" (for the backward pass)
+                    x_phys_flat = refiner.straight_through_sample(pi, mu)
+                    
+                    x_phys = x_phys_flat.view(bs, nframes, njoints, nfeats).permute(0, 2, 3, 1).contiguous()
+
+                    # Detects if data is actually a large 263D vector (hml_vec) 
+                    # instead of the expected [22, 6] rot6d format.
+                    is_hml_vec = (x_phys.shape[1] == 263) or (x_phys.shape[2] == 263)
+                    l_vo = 0.0
+
+                    if is_hml_vec:
+                        # 1. Handle Dimensions: [B, 263, 1, T] -> [B, 263, T]
+                        if x_phys.shape[2] == 1: x_phys = x_phys.squeeze(2)
+                        if x_start.shape[2] == 1: x_start_sq = x_start.squeeze(2)
+                        else: x_start_sq = x_start
+
+                        # 2. Get Statistics for De-normalization
+                        # We need these to recover real meters/seconds
+                        if dataset is not None and hasattr(dataset, 'mean') and hasattr(dataset, 'std'):
+                            # Ensure shapes align: [1, 263, 1]
+                            mean = torch.from_numpy(dataset.mean).to(x_phys.device).view(1, -1, 1)
+                            std = torch.from_numpy(dataset.std).to(x_phys.device).view(1, -1, 1)
+                            
+                            # 3. Recover XYZ using the new function
+                            # JA: Critical Step: The L_VO loss requires absolute (x,y,z) coordinates in meters. 
+                            # The model outputs normalized features (relative velocities, etc.). 
+                            # We must manually de-normalize and integrate velocities to reconstruct the skeleton
+                            # for physics checks.
+                            # x_phys_xyz shape will be [Batch, 22, 3, Frames]
+                            x_phys_xyz = self.recover_hml_xyz(x_phys, mean, std)
+                            target_xyz = self.recover_hml_xyz(x_start_sq, mean, std)
+
+                            # --- SANITY CHECKS (Run once and then comment out) ---
+                            if self.step_count % 100 == 0: # Adjust frequency as needed
+                                print(f"\n[Sanity Check] Step {self.step_count}")
+                                
+                                # 1. Shape Check
+                                # Expect: [Batch, 22, 3, Frames]
+                                print(f"  > Output Shape: {x_phys_xyz.shape}") 
+                                if x_phys_xyz.shape[1] != 22 or x_phys_xyz.shape[2] != 3:
+                                    print("  !! CRITICAL WARNING: Shape mismatch! Expected [B, 22, 3, T]")
+
+                                # 2. Bone Length Consistency Check
+                                # If our velocity integration is wrong, bones will stretch/shrink over time.
+                                # We check the Left Knee (idx 4) -> Left Ankle (idx 7) bone.
+                                # Indices based on HumanML3D standard.
+                                lknee = x_phys_xyz[:, 4, :, :] # [B, 3, T]
+                                lankle = x_phys_xyz[:, 7, :, :]
+                                
+                                # Calculate Euclidean distance for every frame
+                                bone_len = torch.norm(lknee - lankle, dim=1) # [B, T]
+                                
+                                # The standard deviation over time should be close to 0 (rigid bone)
+                                bone_std = bone_len.std(dim=1).mean().item()
+                                bone_avg = bone_len.mean().item()
+                                
+                                print(f"  > Left Shin Length: {bone_avg:.4f} (meters approx)")
+                                print(f"  > Bone Length StdDev: {bone_std:.6f}")
+                                
+                                if bone_std > 0.01:
+                                    print("  !! WARNING: Bones are stretching! Velocity integration might be wrong.")
+                                else:
+                                    print("  > Bones are rigid. Integration looks good.")
+
+                                # 3. Floor Position Check
+                                # Check the lowest Y value. It should be near 0 (ground level).
+                                # If it's -500 or +500, de-normalization is broken.
+                                min_y = x_phys_xyz[:, :, 1, :].min().item()
+                                max_y = x_phys_xyz[:, :, 1, :].max().item()
+                                print(f"  > Vertical Range (Y): Min={min_y:.3f}, Max={max_y:.3f}")
+                                
+                                if min_y < -0.5:
+                                    print("  !! WARNING: Character is sinking under the floor.")
+                            
+                            # 4. Calculate Foot Contact Loss (Virtual Observation)
+                            # Replaced fc_loss_rot_repr with SMPLGeometryWrapper logic
+                            
+                            # Instantiate wrapper (ensure it's on the correct device)
+                            # JA: Wrapper handles the SMPL mesh topology to find specific vertices (toe/heel)
+                            # for collision checks
+                            smpl_geom = SMPLGeometryWrapper().to(x_phys_xyz.device)
+                            
+                            # A. Get Virtual Landmarks using Fixed Offsets
+                            # x_phys_xyz: [Batch, 22, 3, Frames]
+                            landmarks = smpl_geom.get_landmarks_from_skeleton(x_phys_xyz)
+                            
+                            # B. Calculate Metrics
+                            heights = smpl_geom.compute_heights(landmarks)
+                            velocities = smpl_geom.compute_tangential_velocities(landmarks) # [B, T-1]
+                            
+                            # C. Calculate Ground Truth Contact Masks (from target_xyz)
+                            # We use GT velocity to determine when the foot *should* be planted.
+                            gt_l_ankle = target_xyz[:, 10, :, :].permute(0, 2, 1)
+                            gt_r_ankle = target_xyz[:, 11, :, :].permute(0, 2, 1)
+             
+                            # Calculate GT velocities
+                            gt_l_vel = torch.norm(gt_l_ankle[:, 1:] - gt_l_ankle[:, :-1], dim=-1)
+                            gt_r_vel = torch.norm(gt_r_ankle[:, 1:] - gt_r_ankle[:, :-1], dim=-1)
+                            
+                            # Heuristic Contact Threshold (e.g., < 2mm per frame)
+                            contact_thresh = 0.002
+                            gt_l_contact = gt_l_vel < contact_thresh
+                            gt_r_contact = gt_r_vel < contact_thresh
+                            
+                            # D. Compute Physical Losses
+                            l_vo_height = 0.0
+                            l_vo_skate = 0.0
+                            skate_weight = 1.0
+
+                            if self.step_count % 100 == 0: # Print every 100 steps to avoid spam
+                                print(f"\n[DEBUG Step {self.step_count}] Foot Contact Loss Stats:")
+                                print(f"  > Contact Thresh: {contact_thresh}")
+                                print(f"  > GT L_Contact Ratio: {gt_l_contact.float().mean():.4f}")
+                                print(f"  > GT R_Contact Ratio: {gt_r_contact.float().mean():.4f}")
+                            
+                            for name in landmarks.keys():
+                                # 1. Penetration Loss: Penalize negative height
+                                # ReLU(-h) is positive when h is negative (under floor)
+                                l_vo_height += torch.mean(torch.relu(-heights[name]))
+                                
+                                # 2. Skating Loss: Penalize velocity when GT says contact
+                                # JA: Physical Constraint 2: Foot Skating. If GT says foot is planted (mask=1), velocity must be 0.
+
+                                # Determine which foot this landmark belongs to
+                                if 'L_' in name:
+                                    contact_mask = gt_l_contact.float()
+                                else:
+                                    contact_mask = gt_r_contact.float()
+                                
+                                # Velocities are length T-1, match mask length
+                                # We treat the contact constraint as active on the velocity between frames
+                                curr_vel = velocities[name] # [B, T-1]
+                                curr_mask = contact_mask # [B, T-1]
+                                
+                                l_vo_skate += torch.mean(curr_vel * curr_mask)
+
+                            # Combine terms (Weights can be tuned, e.g., 10.0 for skate)
+                            l_vo = l_vo_height + (l_vo_skate * skate_weight)
+
+                        else:
+                            # Fallback if no stats available (loss is 0)
+                            l_vo = 0.0
+
+                    elif self.data_rep == 'rot6d':
+                        x_phys_xyz = get_xyz(x_phys)
+                        target_xyz = get_xyz(x_start)
+                        l_vo = self.fc_loss_rot_repr(target_xyz, x_phys_xyz, mask)
+
+                    terms["l_vo"] = l_vo
+
+                    mdm_loss = terms["rot_mse"] + terms["l_recon"] + terms["l_vo"]
+            else:
+                # --- 1. Calculate Base MDM Loss ---
+                mdm_loss = terms["rot_mse"] + terms.get('vb', 0.) +\
+                                (self.lambda_vel * terms.get('vel_mse', 0.)) +\
+                                (self.lambda_rcxyz * terms.get('rcxyz_mse', 0.)) + \
+                                (self.lambda_target_loc * terms.get('target_loc', 0.)) + \
+                                (self.lambda_fc * terms.get('fc', 0.))
+                
+            terms["loss"] = mdm_loss
 
         else:
             raise NotImplementedError(self.loss_type)
